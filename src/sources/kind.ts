@@ -1,7 +1,7 @@
 /** SourceKind plugin contract: configuration schema, UI form fields, policy integration, channel adapter, and thread context reader. */
 import type { Agent } from '@deepseek-ai/dsh-agent'
 import type { z } from 'zod'
-import type { OutboundMessage, ScopeResult, Trigger } from '../core/index.ts'
+import type { OutboundMessage, ScopeResult, Ticket, Trigger } from '../core/index.ts'
 import type { Deployment } from '../deployment.ts'
 import type { Commands } from '../infra/commands.ts'
 import type { SourceContext, SourceHost } from './host.ts'
@@ -94,6 +94,11 @@ export interface SourceKind<C extends Record<string, unknown> = Record<string, u
   fields: FieldSpec[]
   /** Health entry names owned by this kind under `health[...]`; no other kind or core loop may report them. */
   health: string[]
+  /** Repository-specific review lookup before an atomic claim/report, and terminal notices to ticket conversations. */
+  review?: {
+    prepare(host: SourceContext, ticketId: string, number: number, signal?: AbortSignal): Promise<() => string | undefined>
+    endNotices(ticket: Ticket, request: string, deployment: Deployment): OutboundMessage[]
+  }
   /** Listening rule for a trigger (or recorded Mandate basis) of this kind; kinds without `scope` listen to everything they produce and observe none of it. */
   scope?(input: { meta: Record<string, unknown> }, config: C): ScopeResult
   /** Outbound reply adapter; kinds without `channel` produce no replies or channel checks. */
@@ -101,7 +106,7 @@ export interface SourceKind<C extends Record<string, unknown> = Record<string, u
   /** Bounded context reader for assessments; assessments of a kind without `threadContext` read none. */
   threadContext?: ThreadContext<C>
   /** Maps a search query to candidate Thread keys (such as `github:12`) and Trigger search terms (such as a Feishu `om_` ID). */
-  find?(query: string): { threads: string[]; terms: string[] }
+  find?(query: string, deployment?: Deployment): { threads: string[]; terms: string[] }
   /** Returns the ID of the Trigger whose message this Trigger replies to, when derivable without a network read. */
   repliesTo?(trigger: Trigger): string | undefined
   /** Policy section for kinds whose senders have their own identity. */

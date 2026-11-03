@@ -12,9 +12,11 @@ import { Runtime } from '../../src/app/runtime.ts'
 import { Store } from '../../src/app/store.ts'
 import { SettingsSchema } from '../../src/policy.ts'
 import { feishuKind, feishuTrigger } from '../../src/sources/feishu.ts'
+import { codebaseKind } from '../../src/sources/codebase.ts'
+import { codebaseArgs } from '../../src/infra/codebase.ts'
 import { githubKind } from '../../src/sources/github.ts'
 import { Commands } from '../../src/infra/commands.ts'
-import { credentialHelper, workerGitConfig } from '../../src/infra/environment.ts'
+import { codebaseSshCommand, credentialHelper, workerGitConfig } from '../../src/infra/environment.ts'
 import type { Trigger } from '../../src/core/index.ts'
 import { testMachine } from './deployment.ts'
 
@@ -132,9 +134,11 @@ export function subagentRuntime(agents: Map<string, FakeAgent>) {
 }
 
 /** @param seed - writes to the database before the Runtime opens it, such as records an earlier version stored. */
-export async function startRuntime(seed?: (store: Store) => void) {
+export async function startRuntime(seed?: (store: Store) => void, platform: 'github' | 'codebase' = 'github') {
   const directory = mkdtempSync(join(tmpdir(), 'orchestrator-host-'))
   const AGENT = join(directory, 'agent-gh'), BOT = join(directory, 'lark-bot')
+  const CLI = join(directory, 'bytedcli'), sshKey = join(directory, 'agent_ed25519')
+  const codebase = { repository: 'example/widgets', cli: CLI, site: 'cn', profile: 'superagent', sshKey }
   const repository = { default_branch: 'master', permissions: { push: true } }
   vi.spyOn(Commands.prototype, 'gh').mockImplementation(async args => args[1] === 'user' ? { login: 'agent-bot' } : repository)
   vi.spyOn(Commands.prototype, 'lark').mockResolvedValue({ users: [{ member_id: MEMBER, name: 'Alice' }], has_more: false })
@@ -149,6 +153,14 @@ export async function startRuntime(seed?: (store: Store) => void) {
     [`${BOT} api GET /open-apis/bot/v3/info --as bot --format ndjson`]: '{"bot":{"open_id":"ou_bot"},"code":0,"msg":"ok"}',
     ['git config -z --show-origin --get-all credential.https://github.com.helper']: `file:${workerGitConfig(directory)}\0${credentialHelper(AGENT)}\0`,
     [scoped]: `global\0credential.helper\n\0global\0credential.https://github.com.helper\n${credentialHelper(AGENT)}\0`,
+  }
+  if (platform === 'codebase') {
+    const reply = (args: string[], data: unknown) => { answers[[CLI, ...codebaseArgs(codebase, args)].join(' ')] = JSON.stringify({ status: 'success', data }) }
+    reply(['user', 'get', '@me'], { User: { Username: 'agent-bot', Email: 'agent@example.test' } })
+    reply(['repo', 'get', codebase.repository], { Repository: { Id: '42', Path: codebase.repository } })
+    reply(['repo', 'member', 'get', '-R', codebase.repository], { member: { canPush: true, user: { username: 'agent-bot' } } })
+    answers['git config --get core.sshCommand'] = codebaseSshCommand(sshKey)
+    answers[scoped] = ''
   }
   /** A prepare command (`sh -c`) waits for this while it is set. */
   const hooks: { prepare?: Promise<void> } = {}
@@ -243,18 +255,22 @@ export async function startRuntime(seed?: (store: Store) => void) {
     jobs: jobs.service, subagents: subagents.service }
   const ctx = new Context()
   for (const [name, service] of Object.entries(services)) ctx.reflect.provide(name, service)
-  for (const cli of [AGENT, BOT]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
+  for (const cli of [AGENT, BOT, CLI]) writeFileSync(cli, '#!/bin/sh\n', { mode: 0o755 })
+  writeFileSync(sshKey, 'test fixture; not a private key', { mode: 0o600 })
   const seeded = new Store(join(directory, 'orchestrator.sqlite'))
-  const sources = { github: { enabled: true, config: { repository: 'acme/widgets', cli: AGENT } }, feishu: { enabled: true, config: { cli: BOT } } }
+  const sources = { github: { enabled: platform === 'github', config: { repository: 'acme/widgets', cli: AGENT } },
+    ...platform === 'codebase' ? { codebase: { enabled: true, config: codebase } } : {}, feishu: { enabled: true, config: { cli: BOT } } }
   seeded.saveSettings(SettingsSchema.parse({ ...seeded.settings(), sources }))
   seed?.(seeded)
   seeded.close()
   const runtime = new Runtime(ctx, testMachine({ stateDir: directory }), vi.fn())
   await runtime.ready
-  runtime.sources.register(feishuKind); runtime.sources.register(githubKind)
+  runtime.sources.register(feishuKind)
+  if (platform === 'github') runtime.sources.register(githubKind)
+  else runtime.sources.register(codebaseKind)
   const settings = runtime.store.settings()
   runtime.store.saveSettings({ ...settings, eval: { ...settings.eval, mode: 'auto' },
-    policy: { ...settings.policy, sources: { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT }, github: { allowed: [{ id: 'alice' }] } } },
+    policy: { ...settings.policy, sources: { feishu: { allowed: [{ id: MEMBER, name: 'Alice' }], syncChat: CHAT }, [platform]: { allowed: [{ id: 'alice' }] } } },
     sources: { ...sources, feishu: { enabled: true, config: { cli: BOT, chats: [{ chatId: CHAT, listen: 'all' }], directMessages: true } } } })
   deliveries.mockClear()
 
@@ -293,7 +309,7 @@ export async function startRuntime(seed?: (store: Store) => void) {
   const step = (sessionId: string) => { steps.get(sessionId)!() }
   /** A step of the worker claims what waits for it, and is cut off before the Session took it. */
   const claim = (sessionId: string) => { claims.get(sessionId)!() }
-  return { runtime, ctx, directory, agents, tools, deliveries, relays, candidates, runTool, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
+  return { runtime, ctx, services, directory, agents, tools, deliveries, relays, candidates, runTool, route, acceptedTicket, api, controller, subprocess, hooks, resolveDefault, stop,
     jobs, subagents, step, claim }
 }
 export type Host = Awaited<ReturnType<typeof startRuntime>>
