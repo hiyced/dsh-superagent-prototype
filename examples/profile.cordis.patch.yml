@@ -10,3 +10,8 @@
 # Feishu is optional: uncomment to enable its Source, then set the bot's lark-cli on the Feishu Source.
 # - id: dsh-superagent-feishu
 #   disabled: false
+# For Codebase, also uncomment these two entries and configure the Codebase Source in the panel.
+# - id: dsh-superagent-github
+#   disabled: true
+# - id: dsh-superagent-codebase
+#   disabled: false

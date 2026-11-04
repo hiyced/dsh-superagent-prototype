@@ -6,6 +6,7 @@ import { sameName } from '../infra/text.ts'
 import type { SourceContext } from './host.ts'
 import type { ChannelLink, ChannelLinks } from './kind.ts'
 import { githubAddress, githubPage } from './github-trigger.ts'
+import { githubAccount } from '../deployment.ts'
 
 const CommentSchema = z.looseObject({
   id: z.number(), body: z.string().nullish(), in_reply_to_id: z.number().nullish(), user: z.looseObject({ login: z.string() }).nullish(),
@@ -17,7 +18,8 @@ const missing = (error: unknown): boolean => error instanceof CliError && (error
 /** Posts a comment or review-thread reply with an embedded HTML marker so retries do not create duplicate comments. */
 export async function sendGithub(host: Pick<SourceContext, 'commands'>, message: OutboundMessage): Promise<'sent' | 'gone'> {
   const { commands } = host
-  const { repository, github } = commands.deployment
+  const { repository } = commands.deployment
+  const github = githubAccount(commands.deployment)
   const number = Number(message.channel.address.number)
   if (!number) throw new Error('Missing GitHub reply target')
   try {

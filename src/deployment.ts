@@ -6,8 +6,10 @@ import type { Volatile } from '@deepseek-ai/cordis'
 import s from '@deepseek-ai/schemastery'
 import { z } from 'zod'
 import type { SubprocessRuntime } from '@deepseek-ai/dsh-subprocess'
-import { runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra/environment.ts'
+import { codebaseSshCommand, runAsWorker, sameDirectory, withoutDirectory, workerBin } from './infra/environment.ts'
 import { SetupError } from './setup.ts'
+import { CodebaseAccountsSchema, codebaseArgs, codebaseData } from './infra/codebase.ts'
+import type { Settings } from './policy.ts'
 
 const reason = (error: unknown): string => error instanceof Error ? error.message : String(error)
 const absolute = (description: string) => s.string().pattern(/^\//).description(`${description} Absolute path.`)
@@ -48,12 +50,22 @@ export const GithubAccountsSchema = z.object({
 })
 export const FeishuBotSchema = z.object({ cli: z.string().trim().default('') })
 /** Source configuration keys that affect deployment setup and trigger a restart when changed. */
-export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = { github: Object.keys(GithubAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape) }
+export const SETUP_FIELDS: Readonly<Record<string, readonly string[]>> = {
+  github: Object.keys(GithubAccountsSchema.shape), codebase: Object.keys(CodebaseAccountsSchema.shape), feishu: Object.keys(FeishuBotSchema.shape),
+}
 
 export interface Deployment extends Machine {
   repository: string
-  github: { cli: string; login: string; noreply: string }
+  github?: GithubAccount
+  codebase?: CodebaseAccount
   feishu?: FeishuBot
+}
+export interface GithubAccount { cli: string; login: string; noreply: string }
+export interface CodebaseAccount extends z.infer<typeof CodebaseAccountsSchema> { login: string; repositoryId: string }
+export type GithubDeployment = Deployment & { github: GithubAccount }
+export function githubAccount(deployment: Pick<Deployment, 'github'>): GithubAccount {
+  if (!deployment.github) throw new Error('This deployment has no GitHub account')
+  return deployment.github
 }
 export interface FeishuBot { cli: string; appId: string; brand: 'feishu' | 'lark'; botId: string; name: string }
 
@@ -84,7 +96,7 @@ function parsed<T>(schema: z.ZodType<T>, text: string): T | undefined {
   return result.success ? result.data : undefined
 }
 /** Verify the agent's GitHub CLI identity and push access to the configured repository. */
-export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+export async function resolveDeployment(machine: Machine, github: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<GithubDeployment> {
   const { stateDir } = machine
   const accounts = GithubAccountsSchema.parse(github ?? {})
   const remote = accounts.repository
@@ -103,6 +115,50 @@ export async function resolveDeployment(machine: Machine, github: unknown, probe
   const repository = access.name
   if (access.push !== true) throw new SetupError('repositoryReadOnly', { account: agent.login, repository })
   return { ...machine, repository, github: { cli, login: agent.login, noreply: `${agent.id}+${agent.login}@users.noreply.github.com` } }
+}
+
+export async function resolveCodebase(machine: Machine, value: unknown, probe: Probe, path = process.env.PATH ?? ''): Promise<Deployment> {
+  const fail = (output: string): never => { throw new SetupError('codebaseSetup', { output }) }
+  try {
+    const account = CodebaseAccountsSchema.parse(value ?? {})
+    if (!account.repository || !account.cli || !account.site) fail('Set the Codebase repository, CLI and site.')
+    if (!isAbsolute(account.sshKey)) fail('Set an absolute path to the agent Codebase SSH private key.')
+    if (!statSync(account.sshKey).isFile()) fail('The Codebase SSH key is not a file.')
+    accessSync(account.sshKey, constants.R_OK)
+    const cli = executable(account.cli, path, workerBin(machine.stateDir))
+    const read = async (args: string[]) => codebaseData(await probe([cli, ...codebaseArgs(account, args)]))
+    const user = z.object({ User: z.object({ Username: z.string().min(1), Email: z.string().optional() }) })
+      .parse(await read(['user', 'get', '@me'])).User
+    const repository = z.object({ Repository: z.object({
+      Id: z.union([z.string().regex(/^\d+$/), z.number().int().positive()]).transform(String), Path: z.string().min(1),
+    }) }).parse(await read(['repo', 'get', account.repository])).Repository
+    if (repository.Path.toLowerCase() !== account.repository.toLowerCase()) fail('The repository path changed; update the Codebase Source configuration.')
+    const member = z.object({ member: z.object({ canPush: z.boolean(), user: z.object({ username: z.string() }) }) })
+      .parse(await read(['repo', 'member', 'get', '-R', repository.Path])).member
+    if (member.user.username.toLowerCase() !== user.Username.toLowerCase() || !member.canPush) fail('The Codebase account must have push access to the repository.')
+    const commitEmail = account.commitEmail || user.Email || ''
+    if (!z.email().safeParse(commitEmail).success) fail('Set the Codebase commit email.')
+    // Use the same explicit identity as worker git, and never prompt for a password or unknown host key.
+    await probe(['git', '-c', `core.sshCommand=${codebaseSshCommand(account.sshKey)}`, 'ls-remote',
+      `git@${account.host}:${repository.Path}.git`, 'HEAD'])
+    return { ...machine, repository: repository.Path,
+      codebase: { ...account, cli, repository: repository.Path, repositoryId: repository.Id, login: user.Username, commitEmail } }
+  } catch (error) { return fail(reason(error)) }
+}
+
+/** Selecting an active repository account is a setup change; pausing a Source alone is not. */
+export function repositoryMode(settings: Settings): 'github' | 'codebase' | 'conflict' {
+  const github = settings.sources.github, codebase = settings.sources.codebase
+  const enabled = (source: typeof github) => source?.enabled !== false && !!source?.config.repository
+  if (enabled(github) && enabled(codebase)) return 'conflict'
+  if (enabled(github)) return 'github'
+  return codebase?.config.repository ? 'codebase' : 'github'
+}
+export async function resolveRepository(machine: Machine, settings: Settings, probe: Probe): Promise<Deployment> {
+  const mode = repositoryMode(settings)
+  if (mode === 'conflict') throw new SetupError('repositoryConflict')
+  return mode === 'codebase' ? resolveCodebase(machine, settings.sources.codebase!.config, probe)
+    : resolveDeployment(machine, settings.sources.github?.config, probe)
 }
 
 const AuthStatus = z.object({ appId: z.string().regex(/^cli_[A-Za-z0-9]+$/), brand: z.enum(['feishu', 'lark']).default('feishu'), identities: z.object({ bot: z.object({ status: z.string() }) }) })
